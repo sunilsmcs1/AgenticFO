@@ -1,5 +1,5 @@
-# AFO: cost-aware sequential feature acquisition for intrusion detection
-Code for the paper "An Agentic Framework for Adaptive Feature Optimization in Real-Time Intrusion Detection Systems".
+
+Code for the paper "An Agentic Framework for Adaptive Feature Optimization in Intrusion Detection Systems"
 
 ## Setup
 pip install -r requirements.txt
