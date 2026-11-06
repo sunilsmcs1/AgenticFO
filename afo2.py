@@ -145,6 +145,7 @@ def main():
     Xfit, yfit, Xva, yva = Xtr[tri], ytr[tri], Xtr[vai], ytr[vai]
     sub = np.random.RandomState(0).choice(len(Xfit), min(20000, len(Xfit)), replace=False)
     mi = mutual_info_classif(Xfit[sub], yfit[sub], random_state=0)
+    np.save(f"{out}/mutual_info.npy", mi)
     extras = [i for i in np.argsort(-mi) if i not in set(A)]; ks = [k for k in a.ks if k <= len(extras)]
     if len(extras) not in ks: ks.append(len(extras))
 
@@ -225,6 +226,7 @@ def main():
                 r.update(avg_feat=float(mask.sum(1).mean()), cost_pct=cost_pct(mask, COST), avg_steps=float(steps.mean() + 1))
                 for g in M.GROUPS: r["acq_" + g] = float(mask[:, M.GROUPS[g]].sum(1).mean())
                 if split == "test": r["latency_ms"], r["flows_per_s"] = latency_loop(q, probs, Xte, A)
+                if split == "test": np.savez_compressed(f"{out}/test_preds_lam{lam}_seed{seed}.npz", pred=pred.astype(np.int8), mask=mask.astype(np.int8), y=yte, cat=cte.astype(str))
                 rows.append(dict(method="AFO-v2", param=str(lam), seed=seed, split=split, **r))
             pd.DataFrame(log, columns=["step", "mean_step_reward", "feats"]).to_csv(f"{out}/policy_log_lam{lam}_seed{seed}.csv", index=False)
             print(f"  lam {lam} seed {seed}: test acc {rows[-1]['acc']:.4f} feats {rows[-1]['avg_feat']:.2f} cost% {rows[-1]['cost_pct']:.2f} ({time.time()-t0:.0f}s)", flush=True)
