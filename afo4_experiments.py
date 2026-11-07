@@ -246,10 +246,10 @@ def main():
             lp0 = B.gbm_logp(c0); jobs.append(("AFO, classifier without random masking", "base", dict(gamma=1.0, reward="loss"), c0, lp0))
         for sn in ("low_gap", "high_gap", "uniform", "shared"):
             if sn in a.exps: jobs.append((f"AFO (loss reward)", sn, dict(gamma=1.0, reward="loss"), clf, logp))
-        pol_main = None
+        pols = {}
         for name, sn, kw, cl, lp in jobs:
             q = trainer(seed, a.lam, lp, scen[sn], tag=f"{name}|{sn}", **kw); pr = lambda X, m, lp=lp: np.exp(lp(X, m))
-            if name == "AFO (loss reward)" and sn == "base": pol_main, pr_main = q, pr
+            if name in ("AFO (loss reward)", "AFO greedy (gamma=0)") and sn == "base": pols[name] = (q, pr)
             Pv, mv, sv = rollout(q, pr, Xva, A); Pt, mt, stt = rollout(q, pr, Xte, A)
             thr_v = best_f1_threshold(yva, Pv[:, 1])
             add(name, "val", seed, sn, Pv, mv, sv, yva, None); add(name, "test", seed, sn, Pt, mt, stt, yte, cte)
@@ -257,19 +257,21 @@ def main():
             pd.DataFrame(rows).to_csv(f"{out}/all_rows.csv", index=False)
             np.savez_compressed(f"{out}/test_trace_{''.join(ch if ch.isalnum() else '_' for ch in name)}_{sn}_seed{seed}.npz", pred=(Pt[:, 1] > 0.5).astype(np.int8), p1=Pt[:, 1].astype(np.float32), mask=mt.astype(np.int8), y=yte, cat=cte.astype(str))
             print(f"  {name}|{sn} seed {seed}: acc {rows[-2]['acc']:.4f} cost {rows[-2]['cost_pct']:.2f}% decisions {rows[-2]['decisions']:.2f} ({time.time()-t0:.0f}s)", flush=True)
-        # --- robustness and timing use the main policy
-        if pol_main is not None and "stress" in a.exps:
-            rs = np.random.RandomState(100 + seed)
-            for dr in (0.0, 0.1, 0.3):
-                U = rs.rand(*Xte.shape) < dr; U[:, A] = False
-                P, m, st = rollout(pol_main, pr_main, Xte, A, unavail=U); r = full_metrics(M, yte, cte, P, m, st, scen["base"]); stress.append(dict(test="feature unavailability", level=dr, method="AFO", seed=seed, **r))
-                od = order_for(scen["base"]); k = int(round(np.mean(st)))                       # static comparator with the same average k and same missing features
-                mk = np.zeros_like(m); mk[:, A] = 1; mk[:, od[:k]] = 1; P2 = probs(Xte, mk * (~U)); r2 = full_metrics(M, yte, cte, P2, mk, np.full(len(Xte), k), scen["base"]); stress.append(dict(test="feature unavailability", level=dr, method=f"Fixed order k={k}", seed=seed, **r2))
-            for cap in (0, 1, 2, 3, 5):
-                P, m, st = rollout(pol_main, pr_main, Xte, A, cap=cap); r = full_metrics(M, yte, cte, P, m, st, scen["base"]); stress.append(dict(test="forced early stop (max acquisitions)", level=cap, method="AFO", seed=seed, **r))
+        # --- robustness and timing: every trained base policy (gamma=1 and greedy)
+        if pols and "stress" in a.exps:
+            for pname, (pq, ppr) in pols.items():
+                lab = "AFO" if pname == "AFO (loss reward)" else "AFO greedy"; rs = np.random.RandomState(100 + seed)
+                for dr in (0.0, 0.1, 0.3):
+                    U = rs.rand(*Xte.shape) < dr; U[:, A] = False
+                    P, m, st = rollout(pq, ppr, Xte, A, unavail=U); r = full_metrics(M, yte, cte, P, m, st, scen["base"]); stress.append(dict(test="feature unavailability", level=dr, method=lab, seed=seed, **r))
+                    od = order_for(scen["base"]); k = int(round(np.mean(st)))                       # static comparator with the same average k and same missing features
+                    mk = np.zeros_like(m); mk[:, A] = 1; mk[:, od[:k]] = 1; P2 = probs(Xte, mk * (~U)); r2 = full_metrics(M, yte, cte, P2, mk, np.full(len(Xte), k), scen["base"]); stress.append(dict(test="feature unavailability", level=dr, method=f"Fixed order k={k} (vs {lab})", seed=seed, **r2))
+                for cap in (0, 1, 2, 3, 5):
+                    P, m, st = rollout(pq, ppr, Xte, A, cap=cap); r = full_metrics(M, yte, cte, P, m, st, scen["base"]); stress.append(dict(test="forced early stop (max acquisitions)", level=cap, method=lab, seed=seed, **r))
             pd.DataFrame(stress).to_csv(f"{out}/stress.csv", index=False)
-        if pol_main is not None and "timing" in a.exps:
-            d = time_policy(pol_main, pr_main, Xte, A); d.update(seed=seed, method="AFO (loss reward)"); tim.append(d)
+        if pols and "timing" in a.exps:
+            for pname, (pq, ppr) in pols.items():
+                d = time_policy(pq, ppr, Xte, A); d.update(seed=seed, method=pname); tim.append(d)
             for k in (0, len(order_for(scen["base"]))):
                 od = order_for(scen["base"]); cols = sorted(set(A) | set(od[:k])); cs = HistGradientBoostingClassifier(max_iter=200, random_state=seed).fit(Xfit[:, cols], yfit)
                 tim.append(dict(seed=seed, method=f"Static GBM k={k}", lat_mean=time_static(cs, cols, Xte), decisions=1.0))
@@ -299,12 +301,14 @@ def main():
     # break-even: extraction time per flow (ms, for the FULL feature set, cost assumed proportional to the simulated cost) above which
     # AFO's total time per flow (inference + extraction) is lower than that of a static classifier on all features
     if tim:
-        T = pd.DataFrame(tim); la = T[T.method == "AFO (loss reward)"].lat_mean.mean(); ca = af.cost_pct.mean(); be = []
-        for k in sorted({m for m in T.method if m.startswith("Static")}):
-            ls = T[T.method == k].lat_mean.mean(); full = not k.endswith("k=0")
-            be.append(dict(comparator=k, afo_latency_ms=la, comp_latency_ms=ls, afo_cost_pct=ca,
-                           break_even_full_extraction_ms=((la - ls) / (1 - ca / 100)) if full else np.nan,
-                           note="AFO cheaper in total time once extraction of all features costs more than this" if full else "Group-A-only static is cheaper than AFO at any extraction cost"))
+        T = pd.DataFrame(tim); be = []
+        for pname in sorted({m for m in T.method if m.startswith("AFO")}):
+            la = T[T.method == pname].lat_mean.mean(); ca = t[(t.method == pname) & (t.scenario == "base")].cost_pct.mean()
+            for k in sorted({m for m in T.method if m.startswith("Static")}):
+                ls = T[T.method == k].lat_mean.mean(); full = not k.endswith("k=0")
+                be.append(dict(policy=pname, comparator=k, afo_latency_ms=la, comp_latency_ms=ls, afo_cost_pct=ca,
+                               break_even_full_extraction_ms=((la - ls) / (1 - ca / 100)) if full else np.nan,
+                               note="policy cheaper in total time once extraction of all features costs more than this" if full else "Group-A-only static is cheaper than the policy at any extraction cost"))
         pd.DataFrame(be).to_csv(f"{out}/break_even.csv", index=False); print(pd.DataFrame(be).to_string())
     print("done", f"{time.time()-t0:.0f}s")
 
