@@ -245,7 +245,9 @@ def main():
             c0 = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.1, max_leaf_nodes=63, early_stopping=False, random_state=seed).fit(Xfit, yfit)
             lp0 = B.gbm_logp(c0); jobs.append(("AFO, classifier without random masking", "base", dict(gamma=1.0, reward="loss"), c0, lp0))
         for sn in ("low_gap", "high_gap", "uniform", "shared"):
-            if sn in a.exps: jobs.append((f"AFO (loss reward)", sn, dict(gamma=1.0, reward="loss"), clf, logp))
+            if sn in a.exps:
+                jobs.append(("AFO (loss reward)", sn, dict(gamma=1.0, reward="loss"), clf, logp))
+                jobs.append(("AFO greedy (gamma=0)", sn, dict(gamma=0.0, reward="loss"), clf, logp))
         pols = {}
         for name, sn, kw, cl, lp in jobs:
             q = trainer(seed, a.lam, lp, scen[sn], tag=f"{name}|{sn}", **kw); pr = lambda X, m, lp=lp: np.exp(lp(X, m))
