@@ -15,7 +15,8 @@ Needs afo_eval.py (NSL-KDD) or afo_eval_unsw.py (UNSW-NB15) in the same folder, 
 KDDTest+ / UNSW testing set are used ONLY for the final report; lambda is chosen on a validation split
 carved out of the training set.
 
-Two safeguards (both on by default; --crossfit 0 --thr 0.5 restores the earlier behaviour):
+Two optional safeguards (both OFF by default, so the script reproduces the published v5 results;
+enable with e.g. --crossfit 3 --thr youden):
   * Cross-fitted reward (--crossfit K): the policy's reward and state use OUT-OF-FOLD classifier predictions, from K
     classifiers that never saw the row in question. Otherwise the classifier has memorised the policy's training rows,
     looks over-confident with few features, and the policy learns to stop too early. The classifier used at
@@ -183,9 +184,9 @@ def main():
     ap.add_argument("--clf_epochs", type=int, default=CLF_EPOCHS)
     ap.add_argument("--clf", choices=["gbm", "mlp"], default="gbm", help="masked classifier used inside AFO (default: gradient boosting with NaN for masked features)")
     ap.add_argument("--clf_reps", type=int, default=6, help="masked copies of the training data for the GBM classifier")
-    ap.add_argument("--crossfit", type=int, default=3, help="K>=2: policy reward uses out-of-fold predictions of K classifiers "
-                    "(no classifier has seen the row it scores); 0 = reward from the classifier trained on the same rows (old behaviour)")
-    ap.add_argument("--thr", default="youden", help="attack cut-off, chosen on validation: youden | f1 | a number (0.5 = old behaviour)")
+    ap.add_argument("--crossfit", type=int, default=0, help="K>=2: policy reward uses out-of-fold predictions of K classifiers "
+                    "(no classifier has seen the row it scores); 0 (default) = reward from the classifier trained on the same rows, as in the paper")
+    ap.add_argument("--thr", default="0.5", help="attack cut-off: a number (default 0.5, as in the paper), or chosen on validation: youden | f1")
     ks_default = [0, 1, 2, 3, 5, 8, 12, 20, 40]; ap.add_argument("--ks", type=int, nargs="+", default=ks_default)
     a = ap.parse_args(); M = get_mod(a.dataset)
     if a.thr not in ("youden", "f1"): a.thr = float(a.thr)
