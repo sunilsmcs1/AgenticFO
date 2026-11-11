@@ -14,6 +14,17 @@ Usage (Colab):   python afo2.py --dataset nsl  --seeds 0 1 2 --lams 0.01 0.03 0.
 Needs afo_eval.py (NSL-KDD) or afo_eval_unsw.py (UNSW-NB15) in the same folder, plus the data folders.
 KDDTest+ / UNSW testing set are used ONLY for the final report; lambda is chosen on a validation split
 carved out of the training set.
+
+Two optional safeguards (both OFF by default, so the script reproduces the published v5 results;
+enable with e.g. --crossfit 3 --thr youden):
+  * Cross-fitted reward (--crossfit K): the policy's reward and state use OUT-OF-FOLD classifier predictions, from K
+    classifiers that never saw the row in question. Otherwise the classifier has memorised the policy's training rows,
+    looks over-confident with few features, and the policy learns to stop too early. The classifier used at
+    validation/test time is still the one trained on the whole fit split.
+  * Decision threshold (--thr): the attack/normal cut-off is chosen on the validation split for every method
+    (AFO, masked classifier, static baselines) instead of the fixed 0.5. "youden" maximises TPR - FPR (balanced
+    accuracy), which does not depend on the class ratio and so is robust to the train/test attack-ratio shift
+    (UNSW-NB15). Metrics at the fixed 0.5 cut-off are also saved, with the suffix _t05.
 """
 import argparse, os, time, json, importlib
 import numpy as np, pandas as pd
@@ -36,7 +47,9 @@ class Env:
         s.N = X.shape[1]; s.idx = rng.randint(0, len(X), n); s.mask = np.zeros((n, s.N), np.float32); s.mask[:, s.A] = 1
         s.steps = np.zeros(n, int); s.ell = np.zeros(n); s.p1 = np.zeros(n); s._ell(np.arange(n))
     def _ell(s, rows):
-        lp = s.clf_logp(s.X[s.idx[rows]], s.mask[rows]); yy = s.y[s.idx[rows]]
+        ii = s.idx[rows]
+        lp = s.clf_logp(s.X[ii], s.mask[rows], idx=ii) if getattr(s.clf_logp, "uses_idx", False) else s.clf_logp(s.X[ii], s.mask[rows])
+        yy = s.y[ii]
         s.ell[rows] = -lp[np.arange(len(rows)), yy]; s.p1[rows] = np.exp(lp[:, 1])
     def state(s): return np.concatenate([s.X[s.idx] * s.mask, s.mask, s.p1[:, None]], 1).astype(np.float32)
     def valid(s):
@@ -67,9 +80,10 @@ class Replay:
         j = rng.randint(0, s.n, b); return s.s[j], s.a[j], s.r[j], s.s2[j], s.d[j], s.v2[j]
 
 # ---------------- batched policy rollout (used for validation, test and the Pareto points) ----------------
-def run_policy(policy_q, clf_probs, X, A_idx, bs=8192):
-    """policy_q(state)->Q (k,N+1); clf_probs(X,mask)->(k,2). Returns predictions, final masks, #acquisitions."""
-    n, N = X.shape; pred = np.zeros(n, int); mask = np.zeros((n, N), np.float32); mask[:, A_idx] = 1
+def run_policy(policy_q, clf_probs, X, A_idx, bs=8192, thr=0.5, return_p=False):
+    """policy_q(state)->Q (k,N+1); clf_probs(X,mask)->(k,2). Returns predictions (attack if P(attack) >= thr), final masks,
+    #acquisitions, and with return_p=True also P(attack) at the stopping step. The stopping decisions do not depend on thr."""
+    n, N = X.shape; pred = np.zeros(n, int); p_att = np.zeros(n); mask = np.zeros((n, N), np.float32); mask[:, A_idx] = 1
     steps = np.zeros(n, int); active = np.ones(n, bool)
     for _ in range(N + 1):
         idx = np.where(active)[0]
@@ -78,9 +92,27 @@ def run_policy(policy_q, clf_probs, X, A_idx, bs=8192):
             ii = idx[b:b + bs]; m = mask[ii]; p = clf_probs(X[ii], m)
             q = np.array(policy_q(np.concatenate([X[ii] * m, m, p[:, 1:2]], 1).astype(np.float32)), dtype=float)
             q[:, :N][m > 0] = -np.inf; a = q.argmax(1); st = a == N
-            pred[ii[st]] = p[st].argmax(1); active[ii[st]] = False
+            p_att[ii[st]] = p[st, 1]; pred[ii[st]] = (p[st, 1] >= thr).astype(int); active[ii[st]] = False
             ai = ii[~st]; mask[ai, a[~st]] = 1; steps[ai] += 1
-    return pred, mask, steps
+    return (pred, mask, steps, p_att) if return_p else (pred, mask, steps)
+
+# ---------------- decision threshold chosen on validation ----------------
+def choose_threshold(y, p1, rule="youden"):
+    """Cut-off on P(attack) chosen on VALIDATION data. rule: a number (fixed cut-off), "youden" (max TPR - FPR,
+    i.e. balanced accuracy; independent of the class ratio) or "f1" (max F1 for the attack class)."""
+    if rule not in ("youden", "f1"): return float(rule)
+    y = np.asarray(y).astype(bool); p1 = np.asarray(p1, float)
+    cand = np.unique(np.r_[np.quantile(p1, np.linspace(0, 1, 401)), 0.5])
+    pos = p1[None, :] >= cand[:, None]; tp = (pos & y).sum(1); fp = (pos & ~y).sum(1)
+    P, Nn = max(y.sum(), 1), max((~y).sum(), 1)
+    score = tp / P - fp / Nn if rule == "youden" else 2 * tp / np.maximum(2 * tp + fp + (P - tp), 1)
+    best = np.flatnonzero(score >= score.max() - 1e-12)
+    return float(cand[best[np.argmin(np.abs(cand[best] - 0.5))]])     # ties: the cut-off closest to 0.5
+
+def thr_metrics(M, y, p1, thr, cats=None):
+    """Metrics at the chosen cut-off, plus acc/f1/fpr at the fixed 0.5 cut-off (suffix _t05) for comparison."""
+    r = M.metrics(y, (p1 >= thr).astype(int), cats); r05 = M.metrics(y, (p1 >= 0.5).astype(int))
+    r.update(thr=thr, **{k + "_t05": r05[k] for k in ("acc", "f1", "fpr")}); return r
 
 def latency_loop(policy_q, clf_probs, X, A_idx, n=300):
     idx = np.random.RandomState(0).choice(len(X), min(n, len(X)), replace=False); t = []
@@ -90,12 +122,13 @@ def latency_loop(policy_q, clf_probs, X, A_idx, n=300):
 
 def cost_pct(mask, cost): return 100 * (mask * cost).sum(1).mean() / cost.sum()
 
-def static_family(M, Xfit, yfit, Xte, yte, cte, seed, extras_order, A_idx, ks):
+def static_family(M, Xfit, yfit, Xte, yte, cte, seed, extras_order, A_idx, ks, Xva=None, yva=None, thr_rule=0.5):
     rows = []
     for k in ks:
         cols = sorted(set(A_idx) | set(extras_order[:k])); cols = list(cols)
         clf = HistGradientBoostingClassifier(max_iter=200, random_state=seed).fit(Xfit[:, cols], yfit)
-        p = clf.predict(Xte[:, cols]); r = M.metrics(yte, p, cte)
+        thr = choose_threshold(yva, clf.predict_proba(Xva[:, cols])[:, 1], thr_rule) if Xva is not None else 0.5
+        r = thr_metrics(M, yte, clf.predict_proba(Xte[:, cols])[:, 1], thr, cte)
         t = []
         for i in range(0, min(300, len(Xte))):
             t0 = time.perf_counter(); clf.predict(Xte[i:i + 1, cols]); t.append(time.perf_counter() - t0)
@@ -119,6 +152,21 @@ def train_masked_gbm(Xfit, yfit, A_idx, seed, reps=6, max_iter=200):
     clf = HistGradientBoostingClassifier(max_iter=max_iter, learning_rate=0.1, max_leaf_nodes=63, early_stopping=False, random_state=seed)
     return clf.fit(np.concatenate(Xs), np.concatenate(ys))
 
+def crossfit_logp(Xfit, yfit, A_idx, seed, K, reps, train_fn=None):
+    """Out-of-fold log-probabilities for the policy's training rows: K masked GBMs, each trained without one fold.
+    The returned callable takes idx= (row numbers in Xfit) and uses, for every row, the model that did not see it."""
+    from sklearn.model_selection import StratifiedKFold
+    train_fn = train_fn or (lambda X, y: train_masked_gbm(X, y, A_idx, seed, reps))
+    fold = np.zeros(len(Xfit), int); fns = []
+    for k, (tr, ho) in enumerate(StratifiedKFold(K, shuffle=True, random_state=seed).split(Xfit, yfit)):
+        fold[ho] = k; fns.append(gbm_logp(train_fn(Xfit[tr], yfit[tr])))
+    def f(X, m, idx):
+        out = np.zeros((len(X), 2)); fi = fold[np.asarray(idx)]
+        for k in np.unique(fi):
+            w = fi == k; out[w] = fns[k](X[w], np.asarray(m)[w])
+        return out
+    f.uses_idx = True; return f
+
 def gbm_logp(clf):
     def f(X, m):
         Xin = np.where(np.asarray(m) > 0, X, np.nan).astype(np.float32)
@@ -136,8 +184,14 @@ def main():
     ap.add_argument("--clf_epochs", type=int, default=CLF_EPOCHS)
     ap.add_argument("--clf", choices=["gbm", "mlp"], default="gbm", help="masked classifier used inside AFO (default: gradient boosting with NaN for masked features)")
     ap.add_argument("--clf_reps", type=int, default=6, help="masked copies of the training data for the GBM classifier")
+    ap.add_argument("--crossfit", type=int, default=0, help="K>=2: policy reward uses out-of-fold predictions of K classifiers "
+                    "(no classifier has seen the row it scores); 0 (default) = reward from the classifier trained on the same rows, as in the paper")
+    ap.add_argument("--thr", default="0.5", help="attack cut-off: a number (default 0.5, as in the paper), or chosen on validation: youden | f1")
     ks_default = [0, 1, 2, 3, 5, 8, 12, 20, 40]; ap.add_argument("--ks", type=int, nargs="+", default=ks_default)
-    a = ap.parse_args(); M = get_mod(a.dataset); dev = "cuda" if torch.cuda.is_available() else "cpu"
+    a = ap.parse_args(); M = get_mod(a.dataset)
+    if a.thr not in ("youden", "f1"): a.thr = float(a.thr)
+    if a.crossfit == 1: ap.error("--crossfit must be 0 or >= 2")
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
     data = a.data or ("data" if a.dataset == "nsl" else "data_unsw"); out = a.out or f"results_v2_{a.dataset}"; os.makedirs(out, exist_ok=True)
     N = M.N_FEAT; A = np.array(M.GROUPS["A"]); COST = M.COST_VEC
     Xtr, ytr, Xte, yte, cte = M.load_data(data)
@@ -212,28 +266,38 @@ def main():
         print(f"== seed {seed}: classifier ({time.time()-t0:.0f}s)", flush=True)
         if a.clf == "gbm": logp = gbm_logp(train_masked_gbm(Xfit, yfit, A, seed, a.clf_reps))
         else: logp = mk_logp(train_clf(seed))
+        if a.crossfit >= 2 and a.clf == "gbm":
+            print(f"   cross-fitting {a.crossfit} classifiers for the policy reward ({time.time()-t0:.0f}s)", flush=True)
+            pol_logp = crossfit_logp(Xfit, yfit, A, seed, a.crossfit, a.clf_reps)
+        else:
+            if a.crossfit >= 2: print("   note: --crossfit is implemented for --clf gbm only; using the in-sample classifier", flush=True)
+            pol_logp = logp
         probs = lambda X, m: np.exp(logp(X, m)); ctag = "GBM" if a.clf == "gbm" else "MLP"
         allm = lambda X: np.ones_like(X, np.float32)
         for name, mk in ((f"Masked {ctag}, all features", allm), (f"Masked {ctag}, Group A only", lambda X: np.tile(np.isin(np.arange(N), A).astype(np.float32), (len(X), 1)))):
-            m = mk(Xte); p = probs(Xte, m).argmax(1); r = M.metrics(yte, p, cte); r.update(avg_feat=float(m.sum(1).mean()), cost_pct=cost_pct(m, COST))
+            thr = choose_threshold(yva, probs(Xva, mk(Xva))[:, 1], a.thr)
+            m = mk(Xte); r = thr_metrics(M, yte, probs(Xte, m)[:, 1], thr, cte); r.update(avg_feat=float(m.sum(1).mean()), cost_pct=cost_pct(m, COST))
             rows.append(dict(method=name, param="-", seed=seed, split="test", **r))
-        full_val.append(float((probs(Xva, allm(Xva)).argmax(1) == yva).mean()))
-        rows += static_family(M, Xfit, yfit, Xte, yte, cte, seed, extras, A, ks)
+            if name.endswith("all features"): full_val.append(float(((probs(Xva, allm(Xva))[:, 1] >= thr) == yva).mean()))
+        rows += static_family(M, Xfit, yfit, Xte, yte, cte, seed, extras, A, ks, Xva, yva, a.thr)
         for lam in a.lams:
-            net, log = train_policy(seed, lam, logp); q = mk_q(net)
+            net, log = train_policy(seed, lam, pol_logp); q = mk_q(net); thr = None
             for split, X, y, c in (("val", Xva, yva, None), ("test", Xte, yte, cte)):
-                pred, mask, steps = run_policy(q, probs, X, A); r = M.metrics(y, pred, c)
+                _, mask, steps, p1 = run_policy(q, probs, X, A, return_p=True)
+                if thr is None: thr = choose_threshold(y, p1, a.thr)        # validation split comes first
+                pred = (p1 >= thr).astype(int); r = thr_metrics(M, y, p1, thr, c)
                 r.update(avg_feat=float(mask.sum(1).mean()), cost_pct=cost_pct(mask, COST), avg_steps=float(steps.mean() + 1))
                 for g in M.GROUPS: r["acq_" + g] = float(mask[:, M.GROUPS[g]].sum(1).mean())
                 if split == "test": r["latency_ms"], r["flows_per_s"] = latency_loop(q, probs, Xte, A)
-                if split == "test": np.savez_compressed(f"{out}/test_preds_lam{lam}_seed{seed}.npz", pred=pred.astype(np.int8), mask=mask.astype(np.int8), y=yte, cat=cte.astype(str))
+                if split == "test": np.savez_compressed(f"{out}/test_preds_lam{lam}_seed{seed}.npz", pred=pred.astype(np.int8), p_attack=p1.astype(np.float32), thr=thr, mask=mask.astype(np.int8), y=yte, cat=cte.astype(str))
                 rows.append(dict(method="AFO-v2", param=str(lam), seed=seed, split=split, **r))
             pd.DataFrame(log, columns=["step", "mean_step_reward", "feats"]).to_csv(f"{out}/policy_log_lam{lam}_seed{seed}.csv", index=False)
             print(f"  lam {lam} seed {seed}: test acc {rows[-1]['acc']:.4f} feats {rows[-1]['avg_feat']:.2f} cost% {rows[-1]['cost_pct']:.2f} ({time.time()-t0:.0f}s)", flush=True)
             pd.DataFrame(rows).to_csv(f"{out}/pareto_points.csv", index=False)
     df = pd.DataFrame(rows); full_val_acc = float(np.mean(full_val)); lam_star = choose_lambda(df, full_val_acc)
-    json.dump(dict(selected_lambda=lam_star, full_feature_val_acc=full_val_acc, tol=TOL_VAL), open(f"{out}/selected_lambda.json", "w"))
-    t = df[df.split == "test"]; cols = ["acc", "prec", "rec", "f1", "fpr", "avg_feat", "cost_pct", "latency_ms"]
+    json.dump(dict(selected_lambda=lam_star, full_feature_val_acc=full_val_acc, tol=TOL_VAL, crossfit=a.crossfit, thr_rule=a.thr),
+              open(f"{out}/selected_lambda.json", "w"))
+    t = df[df.split == "test"]; cols = ["acc", "prec", "rec", "f1", "fpr", "thr", "acc_t05", "fpr_t05", "avg_feat", "cost_pct", "latency_ms"]
     g = t.groupby(["method", "param"])[cols]; summ = g.mean().round(4).astype(str) + " +- " + g.std().fillna(0).round(4).astype(str)
     summ.to_csv(f"{out}/summary_test.csv"); print(summ.to_string()); print("selected lambda (validation rule):", lam_star)
     try:

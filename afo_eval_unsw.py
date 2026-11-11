@@ -3,21 +3,23 @@
 afo_eval_unsw.py - UNSW-NB15 version of the evaluation harness for the AFO paper revision.
 
 It computes REAL numbers from YOUR trained agent and baselines on the official
-NSL-KDD KDDTrain+ / KDDTest+ files. Nothing in here produces placeholder results.
+UNSW-NB15 training / testing set files. Nothing in here produces placeholder results.
 
 Quick start
 -----------
-1. Put KDDTrain+.txt and KDDTest+.txt in ./data/   (the 43-column NSL-KDD files).
+1. Put UNSW_NB15_training-set.csv and UNSW_NB15_testing-set.csv in ./data_unsw/.
 2. Edit the three "USER SECTION" items below:
-     a) GROUPS            - the exact feature indices of Groups A/B/C in your Table 1
-     b) load_q_network()  - return a function state(82,) -> Q-values(43,) for a seed
+     a) GROUPS            - the feature names of Groups A/B/C in your Table 1
+     b) load_q_network()  - return a function state(84,) -> Q-values(44,) for a seed
      c) (optional) make_static_model() - your own static DL baseline
-3. python afo_eval.py --seeds 0 1 2 3 4 5 6 7 8 9 --out results
+3. python afo_eval_unsw.py --seeds 0 1 2 3 4 5 6 7 8 9 --out results_unsw
 
 Assumptions that MUST match your training code (edit if they do not)
-- State = [masked feature values (41) | acquisition mask (41)]  -> 82 inputs (as in the paper).
-- Actions 0..40 = acquire feature i; 41 = classify Normal; 42 = classify Attack  -> 43 actions.
-- Categorical columns are label-encoded (not one-hot), so the state stays 82-dimensional.
+- 42 features: id, attack_cat and label are not features.
+- State = [masked feature values (42) | acquisition mask (42)]  -> 84 inputs.
+- Actions 0..41 = acquire feature i; 42 = classify Normal; 43 = classify Attack  -> 44 actions.
+- Categorical columns (proto, service, state) are label-encoded (not one-hot), so the state stays 84-dimensional.
+- Heavy-tailed columns (max > 1000 on the training set) are log1p-transformed before min-max scaling.
 - Already-acquired features are masked out of the action set (MASK_ACQUIRED).
 - An episode is cut off after MAX_STEPS actions; the forced label is the better of the two
   classify-action Q-values (FORCED_RULE). State this choice in the paper.
